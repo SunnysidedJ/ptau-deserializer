@@ -8,6 +8,8 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	curve "github.com/consensys/gnark-crypto/ecc/bn254"
+	curveMPCSetup "github.com/consensys/gnark-crypto/ecc/bn254/mpcsetup"
+	gnarkio "github.com/consensys/gnark/io"
 )
 
 type Phase1 struct {
@@ -124,49 +126,64 @@ func WritePhase1FromPtauFile(ptauFile *PtauFile, outputPath string) error {
 	}
 	defer outputFile.Close()
 
-	var header Header
-
 	writer := bufio.NewWriter(outputFile)
 	defer writer.Flush()
 
-	N := ptauFile.DomainSize()
-
+	N := uint64(ptauFile.DomainSize())
 	fmt.Printf("Power %d supports up to %d constraints\n", ptauFile.Header.Power, N)
 
-	header.Power = byte(ptauFile.Header.Power)
+	// Match gnark's Phase1.WriteTo format: three update proofs then SRS parameters.
+	var emptyProof curveMPCSetup.UpdateProof
+	for i := 0; i < 3; i++ {
+		if _, err := emptyProof.WriteTo(writer); err != nil {
+			return err
+		}
+	}
 
-	// can be extracted from ptau.Contributions (7) but hardcoding for now
-	// ptau link: https://github.com/iden3/snarkjs/tree/master#7-prepare-phase-2
-	header.Contributions = 54
-
-	// Write the header
-	err = header.writeTo(outputFile)
-	if err != nil {
+	enc := bn254.NewEncoder(writer)
+	if err := enc.Encode(N); err != nil {
 		return err
 	}
 
-	// BN254 encoder using compressed representation of points to save storage space
-	enc := bn254.NewEncoder(writer)
-	fmt.Println("1. Writing TauG1")
+	betaG2, err := ptauFile.ReadBetaG2()
+	if err != nil {
+		return err
+	}
+	if err := enc.Encode(&betaG2); err != nil {
+		return err
+	}
+
+	// gnark expects TauG1[1:] (generator at index 0 is implicit).
+	fmt.Println("1. Writing TauG1 (skip index 0)")
 	tauG1 := make(chan curve.G1Affine, 10000)
 	go ptauFile.ReadTauG1(tauG1)
+	firstTauG1 := true
 	for point := range tauG1 {
+		if firstTauG1 {
+			firstTauG1 = false
+			continue
+		}
 		if err := enc.Encode(&point); err != nil {
 			return err
 		}
 	}
 
-	// Write α[τ⁰]₁, α[τ¹]₁, α[τ²]₁, …, α[τᴺ⁻¹]₁
-	fmt.Println("2. Writing AlphaTauG1")
-	alphaTauG1 := make(chan curve.G1Affine, 10000)
-	go ptauFile.ReadAlphaTauG1(alphaTauG1)
-	for point := range alphaTauG1 {
+	// gnark expects TauG2[1:] (generator at index 0 is implicit).
+	fmt.Println("2. Writing TauG2 (skip index 0)")
+	tauG2 := make(chan curve.G2Affine, 10000)
+	go ptauFile.ReadTauG2(tauG2)
+	firstTauG2 := true
+	for point := range tauG2 {
+		if firstTauG2 {
+			firstTauG2 = false
+			continue
+		}
 		if err := enc.Encode(&point); err != nil {
 			return err
 		}
 	}
 
-	// Write β[τ⁰]₁, β[τ¹]₁, β[τ²]₁, …, β[τᴺ⁻¹]₁
+	// Important: gnark serializes BetaTau before AlphaTau.
 	fmt.Println("3. Writing BetaTauG1")
 	betaTauG1 := make(chan curve.G1Affine, 10000)
 	go ptauFile.ReadBetaTauG1(betaTauG1)
@@ -176,24 +193,18 @@ func WritePhase1FromPtauFile(ptauFile *PtauFile, outputPath string) error {
 		}
 	}
 
-	// Write {[τ⁰]₂, [τ¹]₂, [τ²]₂, …, [τᴺ⁻¹]₂}
-	fmt.Println("4. Writing TauG2")
-	tauG2 := make(chan curve.G2Affine, 10000)
-	go ptauFile.ReadTauG2(tauG2)
-	for point := range tauG2 {
+	fmt.Println("4. Writing AlphaTauG1")
+	alphaTauG1 := make(chan curve.G1Affine, 10000)
+	go ptauFile.ReadAlphaTauG1(alphaTauG1)
+	for point := range alphaTauG1 {
 		if err := enc.Encode(&point); err != nil {
 			return err
 		}
 	}
 
-	// Write [β]₂
-	fmt.Println("5. Writing BetaG2")
-	betaG2, err := ptauFile.ReadBetaG2()
-	if err != nil {
-		return err
-	}
-	enc.Encode(&betaG2)
-	return nil
+	// No transcript challenge for imported phase1.
+	_, err = gnarkio.WriteBytesShort(nil, writer)
+	return err
 }
 
 func WritePhase1(phase1 Phase1, power byte, outputPath string) error {
